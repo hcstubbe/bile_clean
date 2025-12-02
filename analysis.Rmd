@@ -1,0 +1,905 @@
+---
+title: "Bile predicaments"
+author: "HCS"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: united
+    toc_float: yes
+    toc: yes
+    number_sections: yes
+    code_folding: hide
+  word_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  html_notebook:
+    theme: united
+    toc_float: yes
+    toc: yes
+    number_sections: yes
+    code_folding: hide
+---
+
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+
+# Prepare analysis
+## Required packages
+Load the R packages required for the analysis.
+```{r}
+library(tidyverse)     # data handling
+library(openxlsx)      # read/write xlsx files
+library(readxl)        # read xlsx files
+library(compareGroups) # Descriptive statistics and tables
+library(cardx)         # Analyses for R
+library(gtsummary)     # Create tables
+library(caret)         # Calculate sensitivity, specificity and predictive values 
+library(ggpubr)        # Visualization
+library(ggsci)
+library(FactoMineR)    # Visualization
+library(factoextra)    # Visualization
+library(ggmosaic)      # Visualization
+library(kableExtra)    # Render tables
+library(ROCit)         # ROC curves
+```
+
+
+
+## Auxiliary functions
+Custom functions used in the analysis.
+```{r}
+# Compute performance metrics of diagnostic tests
+# Cmompute 95% CIs for all parameters
+
+#' Compute performance metrics (sensitivity, specificity, PPV, NPV, accuracy, LRs, F1)
+#' with 95% confidence intervals.
+#'
+#' @param confusion_mtx 2x2 matrix or table. Rows = predicted classes, columns = reference (actual) classes
+#'                      (default common layout produced by caret::confusionMatrix when passing (pred, ref)).
+#'                      If your layout differs, supply the mapping via the index arguments or set
+#'                      argument layout = c("pred_rows_ref_cols", "ref_rows_pred_cols").
+#' @param prevalence Optional numeric giving disease prevalence (for PPV/NPV if you want to override sample prevalence).
+#' @param pos Name of the positive class.
+#' @param neg Name of the negative class.
+#' @param ci_level Confidence level (default 0.95).
+#' @param ci_method One of "wilson", "wald", "exact".
+#' @param layout Either "pred_rows_ref_cols" (default) or "ref_rows_pred_cols".
+#' @param add_additional If TRUE add accuracy, likelihood ratios, F1 (with CIs where applicable).
+#' @param clamp Whether to clamp CI limits to [0,1] for proportion metrics.
+#' @return Named numeric vector (or list) of metrics with CIs.
+#' @importFrom stats binom.test
+#' @examples
+#' # Example (assumes you have caret installed for sensitivity()/specificity()/posPredValue()/negPredValue())
+#' # library(caret)
+#' # m <- matrix(c(50,10,5,200), nrow=2,
+#' #             dimnames=list(Predicted=c("yes","no"), Actual=c("yes","no")))
+#' # get_perf(m, pos="yes", neg="no")
+get_perf <- function(confusion_mtx,
+                     prevalence = NULL,
+                     pos = "yes",
+                     neg = "no",
+                     ci_level = 0.95,
+                     ci_method = c("wilson","wald","exact"),
+                     layout = c("pred_rows_ref_cols","ref_rows_pred_cols"),
+                     add_additional = TRUE,
+                     clamp = TRUE) {
+
+  ci_method <- match.arg(ci_method)
+  layout    <- match.arg(layout)
+
+  # Basic validation
+  if (!is.matrix(confusion_mtx) && !is.table(confusion_mtx)) {
+    stop("confusion_mtx must be a 2x2 matrix or table.")
+  }
+  if (any(dim(confusion_mtx) != 2)) {
+    stop("confusion_mtx must be 2x2.")
+  }
+
+  # Ensure dimnames
+  dn <- dimnames(confusion_mtx)
+  if (is.null(dn) || any(vapply(dn, is.null, logical(1)))) {
+    stop("confusion_mtx must have dimnames for both dimensions (predicted and actual classes).")
+  }
+
+  # Reorient if needed
+  # After this block we want rows = predicted, columns = actual
+  if (layout == "ref_rows_pred_cols") {
+    confusion_mtx <- t(confusion_mtx)
+  }
+
+  if (!(pos %in% rownames(confusion_mtx)) || !(pos %in% colnames(confusion_mtx))) {
+    stop("Positive class 'pos' must appear in both row and column names.")
+  }
+  if (!(neg %in% rownames(confusion_mtx)) || !(neg %in% colnames(confusion_mtx))) {
+    stop("Negative class 'neg' must appear in both row and column names.")
+  }
+
+  # Extract cells
+  # Convention:
+  # TP: predicted = pos, actual = pos
+  # FP: predicted = pos, actual = neg
+  # FN: predicted = neg, actual = pos
+  # TN: predicted = neg, actual = neg
+  TP <- confusion_mtx[pos, pos]
+  FP <- confusion_mtx[pos, neg]
+  FN <- confusion_mtx[neg, pos]
+  TN <- confusion_mtx[neg, neg]
+
+  N  <- TP + FP + FN + TN
+
+  # Helper for proportion CIs
+  binom_ci <- function(success, total, level, method) {
+    if (total == 0) return(c(NA, NA))
+    alpha <- 1 - level
+    if (method == "wald") {
+      p <- success / total
+      z <- qnorm(1 - alpha/2)
+      se <- sqrt(p*(1-p)/total)
+      lower <- p - z*se
+      upper <- p + z*se
+    } else if (method == "wilson") {
+      p <- success / total
+      z <- qnorm(1 - alpha/2)
+      denom <- 1 + z^2/total
+      center <- p + z^2/(2*total)
+      half <- z * sqrt(p*(1-p)/total + z^2/(4*total^2))
+      lower <- (center - half)/denom
+      upper <- (center + half)/denom
+    } else if (method == "exact") {
+      bt <- binom.test(success, total, conf.level = level)
+      lower <- bt$conf.int[1]
+      upper <- bt$conf.int[2]
+    }
+    if (clamp) {
+      lower <- max(0, lower)
+      upper <- min(1, upper)
+    }
+    c(lower, upper)
+  }
+
+  # Proportion + CI wrapper
+  prop_with_ci <- function(success, total) {
+    p <- if (total == 0) NA_real_ else success / total
+    ci <- binom_ci(success, total, ci_level, ci_method)
+    list(estimate = p, lower = ci[1], upper = ci[2])
+  }
+
+  # Core metrics
+  sens <- prop_with_ci(TP, TP + FN)          # Sensitivity
+  spec <- prop_with_ci(TN, TN + FP)          # Specificity
+  ppv  <- prop_with_ci(TP, TP + FP)          # PPV
+  npv  <- prop_with_ci(TN, TN + FN)          # NPV
+  acc  <- prop_with_ci(TP + TN, N)           # Accuracy
+
+  # Prevalence (sample vs provided) (used only for reporting)
+  prev_sample <- (TP + FN)/N
+  prev <- if (is.null(prevalence)) prev_sample else prevalence
+  prev_ci <- prop_with_ci(TP + FN, N) # sample prevalence CI
+
+  # Additional metrics
+  add_list <- list()
+  if (add_additional) {
+    # Likelihood Ratios (CIs via log method)
+    # LR+ = sens / (1 - spec)
+    # LR- = (1 - sens) / spec
+    # Var(log(LR+)) = Var(log(sens)) + Var(log(1-spec))
+    # Approx Var(p) ~ p(1-p)/n; Delta method.
+    sens_p <- sens$estimate; spec_p <- spec$estimate
+    sens_n <- TP + FN; spec_n <- TN + FP
+
+    lr_plus <- if (is.na(sens_p) || is.na(spec_p) || spec_p == 1) NA else sens_p / (1 - spec_p)
+    lr_minus <- if (is.na(sens_p) || is.na(spec_p) || spec_p == 0) NA else (1 - sens_p) / spec_p
+
+    lr_plus_ci <- c(NA, NA)
+    lr_minus_ci <- c(NA, NA)
+
+    z <- qnorm(1 - (1-ci_level)/2)
+
+    if (!is.na(lr_plus) && !is.na(sens_p) && !is.na(spec_p) &&
+        sens_p > 0 && sens_p < 1 && spec_p > 0 && spec_p < 1 &&
+        sens_n > 0 && spec_n > 0 && (1 - spec_p) > 0) {
+      var_log_sens <- (1 - sens_p)/(sens_p * sens_n)
+      var_log_1minus_spec <- spec_p / ((1 - spec_p) * spec_n)
+      se_log_lr_plus <- sqrt(var_log_sens + var_log_1minus_spec)
+      lr_plus_ci <- exp(log(lr_plus) + c(-1,1)*z*se_log_lr_plus)
+    }
+
+    if (!is.na(lr_minus) && !is.na(sens_p) && !is.na(spec_p) &&
+        sens_p > 0 && sens_p < 1 && spec_p > 0 && spec_p < 1 &&
+        sens_n > 0 && spec_n > 0) {
+      var_log_1minus_sens <- sens_p / ((1 - sens_p) * sens_n)
+      var_log_spec <- (1 - spec_p)/(spec_p * spec_n)
+      se_log_lr_minus <- sqrt(var_log_1minus_sens + var_log_spec)
+      lr_minus_ci <- exp(log(lr_minus) + c(-1,1)*z*se_log_lr_minus)
+    }
+
+    # F1 score (no simple exact CI; use Delta approx on logit? We'll skip CI or bootstrap; provide NA or Wald)
+    precision_p <- ppv$estimate
+    recall_p <- sens_p
+    f1 <- if (is.na(precision_p) || is.na(recall_p) || (precision_p + recall_p) == 0) NA else
+      2 * precision_p * recall_p / (precision_p + recall_p)
+    # Provide naive bootstrap possibility? Keep simple: no CI
+    f1_ci <- c(NA, NA)
+
+    add_list <- list(
+      lr_positive = lr_plus,
+      lr_positive_lower_ci = lr_plus_ci[1],
+      lr_positive_upper_ci = lr_plus_ci[2],
+      lr_negative = lr_minus,
+      lr_negative_lower_ci = lr_minus_ci[1],
+      lr_negative_upper_ci = lr_minus_ci[2],
+      f1 = f1,
+      f1_lower_ci = f1_ci[1],
+      f1_upper_ci = f1_ci[2]
+    )
+  }
+
+  # "Rule-out" custom metrics the original code had:
+  # Original code used confusion_mtx[1] and confusion_mtx[3] which are column-major indices.
+  # We'll interpret "Correct rule-out (ERCP avoided)" as TN and "False rule-out (IDCs missed)" as FN.
+  correct_rule_out <- TN
+  false_rule_out   <- FN
+  correct_rule_out_prop <- if (N == 0) NA else correct_rule_out / N
+  false_rule_out_prop   <- if (N == 0) NA else false_rule_out / N
+
+  correct_rule_out_ci <- prop_with_ci(correct_rule_out, N)
+  false_rule_out_ci   <- prop_with_ci(false_rule_out, N)
+
+  # Assemble result
+  res_list <- c(
+    # Counts
+    TP = TP, FP = FP, FN = FN, TN = TN, N = N,
+    # Prevalence
+    prevalence_sample = prev_sample,
+    prevalence_sample_lower_ci = prev_ci$lower,
+    prevalence_sample_upper_ci = prev_ci$upper,
+    prevalence_used = prev,
+    # Sensitivity
+    sensitivity = sens$estimate,
+    sensitivity_lower_ci = sens$lower,
+    sensitivity_upper_ci = sens$upper,
+    # Specificity
+    specificity = spec$estimate,
+    specificity_lower_ci = spec$lower,
+    specificity_upper_ci = spec$upper,
+    # PPV
+    ppv = ppv$estimate,
+    ppv_lower_ci = ppv$lower,
+    ppv_upper_ci = ppv$upper,
+    # NPV
+    npv = npv$estimate,
+    npv_lower_ci = npv$lower,
+    npv_upper_ci = npv$upper,
+    # Accuracy
+    accuracy = acc$estimate,
+    accuracy_lower_ci = acc$lower,
+    accuracy_upper_ci = acc$upper,
+    # Rule-out metrics
+    `Correct rule-out (ERCP avoided) [n]` = correct_rule_out,
+    `Correct rule-out (ERCP avoided) [%]` = correct_rule_out_prop * 100,
+    `Correct rule-out (ERCP avoided) [%]_lower_ci` = correct_rule_out_ci$lower * 100,
+    `Correct rule-out (ERCP avoided) [%]_upper_ci` = correct_rule_out_ci$upper * 100,
+    `False rule-out (IDCs missed) [n]` = false_rule_out,
+    `False rule-out (IDCs missed) [%]` = false_rule_out_prop * 100,
+    `False rule-out (IDCs missed) [%]_lower_ci` = false_rule_out_ci$lower * 100,
+    `False rule-out (IDCs missed) [%]_upper_ci` = false_rule_out_ci$upper * 100
+  )
+
+  if (add_additional) {
+    res_list <- c(res_list, add_list)
+  }
+
+  # Rounding (keep counts & LRs un-rounded or lightly rounded)
+  round_if_prob <- function(name, value) {
+    if (is.na(value)) return(NA_real_)
+    # Do not round counts (integers)
+    if (grepl("\\[n\\]$", name) || name %in% c("TP","FP","FN","TN","N")) {
+      return(value)
+    }
+    # Likelihood ratios: 3 decimals
+    if (grepl("^lr_", name)) {
+      return(round(value, 3))
+    }
+    # Proportions (0-1)
+    if (value >= 0 && value <= 1 && !grepl("\\[%\\]", name)) {
+      return(round(value, 3))
+    }
+    # Percentages
+    if (grepl("\\[%\\]", name)) {
+      return(round(value, 2))
+    }
+    # F1 etc (0-1)
+    if (name == "f1" || grepl("^f1_", name)) {
+      return(round(value, 3))
+    }
+    return(value)
+  }
+
+  res_list <- mapply(round_if_prob, names(res_list), res_list, SIMPLIFY = TRUE, USE.NAMES = TRUE)
+
+  res_list
+}
+
+
+
+
+# Summarize and add lab data 
+add_lab = function (x_id) {
+    # This function selects lab data within 24h before CTPA,
+    # summarizes and adds it to the clinical data
+    x_tab = visit_table_v0 %>%
+      filter(pid == x_id)
+    x_timing_cta = x_tab$timing_cta
+    x_lab_data = aggregated_lab_data %>%
+      filter(id == x_id & ((x_timing_cta - .$time) %in% c(0:1)))
+    is_empty = FALSE
+    if(nrow(x_lab_data) == 0) {
+      x_lab_data = aggregated_lab_data[1,]
+      for (i in 1:ncol(x_lab_data))
+      {
+        x_lab_data[,i] = -1
+        x_lab_data[1,3] = NA}
+      x_lab_data$id = x_id
+      is_empty = TRUE
+    }
+    x_summary = x_lab_data %>%
+      select(-c(1,2)) %>%
+      summary() %>%
+      apply(c(1,2),
+            function(x){suppressWarnings(as.numeric(sub('.*:', '', x)))})
+    rownames(x_summary) = c("min",
+                            "q1",
+                            "median",
+                            "mean",
+                            "q3",
+                            "max",
+                            "NA")
+    x_summary = x_summary %>%
+      as_tibble(rownames = "rnms") %>%
+      pivot_longer(cols = 2:ncol(.)) %>%
+      add_column(val_name = paste("lab", .$rnms, .$name, sep = "_"),
+                 .before = 1) %>%
+      select("val_name", "value") %>%
+      mutate(val_name = gsub(pattern = " ", replacement = "", val_name))
+    x_list = as.list(x_summary$value)
+    names(x_list) = x_summary$val_name
+    if(is_empty == TRUE){x_list = lapply(x_list, function(x){NA})}
+    x_list = lapply(x_list, function(x){ifelse(x>=0, x, NA)}) # remove neg. values
+    x_list = x_list %>% data.frame() %>% as_tibble()
+    x_tab = x_tab %>% add_column(x_list)
+    x_tab
+}
+
+
+# Get ROC dataframe
+make_roc_df = function(data, score, score_name){
+    roc_empirical = rocit(score = score,
+                          class = data$has_idc,
+                          negref = "no")
+    ci95=ciAUC(roc_empirical)
+    roc_df = data_frame(TPR = roc_empirical$TPR, 
+                        FPR = roc_empirical$FPR, 
+                        Score = score_name, 
+                        AUC = round(roc_empirical$AUC, digits = 3),
+                        "CI95_upper" = round(ci95$lower, digits = 3),
+                        "CI95_lower" = round(ci95$upper, digits = 3))
+    return(roc_df)
+}
+```
+
+
+
+
+## Import data
+Import data and perform some pre-processing (filter deleted database rows, define column data types, etc.)
+```{r}
+# Import data
+all_data = read_csv("data/input_data_tab1.csv")
+test_df = read_csv("data/test_df_pandas.csv")
+model_cols_df = read_csv("data/model_cols_df.csv")
+```
+
+Add columns
+```{r}
+all_data$has_mrcp = !is.na(all_data$mrcp_date)
+all_data$has_eus = !is.na(all_data$eus_date)
+all_data$has_ercp = !is.na(all_data$ercp_date)
+all_data$has_abdominal_sonography = !is.na(all_data$abdominal_sonography_date)
+all_data$has_ct_mri = !is.na(all_data$ct_mri_date)
+```
+
+
+# Results
+
+## Patient characteristics
+
+### Tabel 1 Patient characteristics
+General characteristics of the cohort.
+```{r include=FALSE}
+colnames(all_data) = make.names(colnames(all_data))
+colnames(all_data)
+```
+
+```{r}
+all_data$clinical_data_pain_onset_in_days_before_admission = as.numeric(all_data$clinical_data_pain_onset_in_days_before_admission)
+all_data$eus_ercp_mrcp_or_as_dhc_width_in_mm = as.numeric(all_data$eus_ercp_mrcp_or_as_dhc_width_in_mm)
+
+
+summary_data = all_data[, -c(1:2)] %>% select(starts_with(c("has_idc",
+                                                 "baseline_",
+                                                 "lab_values_admission_",
+                                                 "clinical_data_",
+                                                 "eus_ercp_mrcp_or_as_dhc_width_in_mm",
+                                                 "has_")) & !contains("date"))
+summary_table = gtsummary::tbl_summary(summary_data, by = has_idc, type = list(eus_ercp_mrcp_or_as_dhc_width_in_mm ~ "continuous", clinical_data_pain_onset_in_days_before_admission ~ "continuous")) 
+summary_table = gtsummary::add_p(summary_table) 
+# summary_table = gtsummary::add_ci(summary_table)
+
+summary_table
+```
+
+
+
+## Prediction performances
+
+### TFDF model parameters
+TensorFlow Decision Forests (TFDF) for the detection of IDC.
+
+```{r}
+model_cols_df
+```
+
+### Figure 2
+Variable importances
+```{r}
+feature_importances = read_csv("data/feature_importances.csv")
+feature_importances$feature_names[feature_importances$feature_names == "alkaline_phosphatase_in_u_l"] = "alkaline phosphatase"
+feature_importances$feature_names[feature_importances$feature_names == "got_ast_in_u_l"] = "got/ast"
+feature_importances$feature_names[feature_importances$feature_names == "nicotine_use"] = "nicotine use"
+
+feature_importances$feature_names = str_to_upper(feature_importances$feature_names)
+feature_importances$feature_names = sapply(feature_importances$feature_names, function(x) strsplit(x, "_")[[1]][[1]])
+
+# Rename some features:
+feature_importances$feature_names[feature_importances$feature_names == "GPT"] = "ALT"
+feature_importances$feature_names[feature_importances$feature_names == "GOT/AST"] = "AST"
+
+# Plot
+p = ggplot2::ggplot(feature_importances, aes(y = feature_importances, x = reorder(feature_names, feature_importances), color = str_to_title(feature_type))) +
+    geom_point() +
+    geom_segment(aes(x=feature_names,xend=feature_names,y=0,yend=feature_importances)) +
+    labs(# title = "Variable importance",
+         y = "Importance [inverted mean minimal depth]",
+         x = "Variable",
+         color = "Type") +
+    coord_flip() + 
+    theme_minimal() +
+    theme(legend.position="right")
+  
+ggplot2::ggsave("Figure 2. Variable importance.pdf", p, device = "pdf", height = 8, width = 10)
+p
+```
+
+**Figure 2. Variable importance.** The importance of each variable included in the TFDF-model as estimated by the inverted mean minimal depth of each variable in the decision tree.
+
+```{r}
+# Set prevalence of idc
+prevalence_idc = sum(all_data$has_idc == "1")/nrow(all_data)
+```
+
+
+
+### TFDF-model
+
+Tensorflow random forests model.
+```{r}
+test_df$has_idc = as.character(test_df$has_idc)
+test_df$has_idc[test_df$has_idc == "1"] = "yes"
+test_df$has_idc[test_df$has_idc == "0"] = "no"
+test_df$pred_idc = as.character(test_df$pred_idc)
+test_df$pred_idc[test_df$pred_idc == TRUE] = "yes"
+test_df$pred_idc[test_df$pred_idc == FALSE] = "no"
+
+table_tfdf = table(test_df[, c("pred_idc", "has_idc")])
+confusionMatrix(table_tfdf, prevalence = prevalence_idc, positive = "yes")
+```
+
+
+
+### CBD model
+CBD 8 mm or larger
+```{r}
+test_df$cbd_gte_6mm = "no"
+test_df$cbd_gte_6mm[test_df$dhc_in_mm >= 6] = "yes"
+test_df$cbd_gte_7mm = "no"
+test_df$cbd_gte_7mm[test_df$dhc_in_mm >= 7] = "yes"
+test_df$cbd_gte_8mm = "no"
+test_df$cbd_gte_8mm[test_df$dhc_in_mm >= 8] = "yes"
+
+# table_dhc = table(test_df[, c("cbd_gte_6mm", "has_idc")])
+# confusionMatrix(table_dhc, prevalence = prevalence_idc, positive = "yes")
+# table_dhc = table(test_df[, c("cbd_gte_7mm", "has_idc")])
+# confusionMatrix(table_dhc, prevalence = prevalence_idc, positive = "yes")
+table_dhc = table(test_df[, c("cbd_gte_8mm", "has_idc")])
+confusionMatrix(table_dhc, prevalence = prevalence_idc, positive = "yes")
+
+
+test_df$bili_gte_4 = "no"
+test_df$bili_gte_4[test_df$lab_values_admission_bilirubin_in_mg_dl >= 4] = "yes"
+
+table_bil = table(test_df[, c("bili_gte_4", "has_idc")])
+
+
+test_df$cbd_gte_8mm_AND_bili_gte_4 = "no"
+test_df$cbd_gte_8mm_AND_bili_gte_4[test_df$lab_values_admission_bilirubin_in_mg_dl >= 4 & test_df$dhc_in_mm >= 8] = "yes"
+
+table_dhc_and_bil = table(test_df[, c("cbd_gte_8mm_AND_bili_gte_4", "has_idc")])
+
+
+
+```
+
+<!-- ### Neuronal networks -->
+<!-- Confusion matrix of the neuronal network model. Of note, this only comprises data from the test dataset. -->
+<!-- ```{r} -->
+<!-- mtx = matrix(c(5,3,3,61), nrow = 2) -->
+<!-- dimnames(mtx) = list(c("FALSE", "TRUE"), c("FALSE", "TRUE")) -->
+<!-- table_tfnn = as.table(mtx) -->
+<!-- confusionMatrix(table_tfnn, positive = pos, prevalence = 0.147) -->
+<!-- ``` -->
+
+### Subgroups
+```{r}
+stones = filter(test_df, (clinical_data_stone_microlithiasis_sludge %in% c(1,4,5,7)))
+sludge_mic = filter(test_df, (clinical_data_stone_microlithiasis_sludge %in% c(2,3,6)))
+```
+
+
+#### Stones
+##### TFDF-model
+
+Tensorflow random forests model.
+```{r}
+stones$has_idc = as.character(stones$has_idc)
+stones$has_idc[stones$has_idc == "1"] = "yes"
+stones$has_idc[stones$has_idc == "0"] = "no"
+stones$pred_idc = as.character(stones$pred_idc)
+stones$pred_idc[stones$pred_idc == TRUE] = "yes"
+stones$pred_idc[stones$pred_idc == FALSE] = "no"
+
+table_tfdf_stones = table(stones[, c("pred_idc", "has_idc")])
+confusionMatrix(table_tfdf_stones, prevalence = prevalence_idc, positive = "yes")
+```
+
+
+##### CBD model
+CBD 8 mm or larger
+```{r}
+stones$cbd_gte_8mm = "no"
+stones$cbd_gte_8mm[stones$dhc_in_mm >= 8] = "yes"
+
+table_dhc_stones = table(stones[, c("cbd_gte_8mm", "has_idc")])
+confusionMatrix(table_dhc_stones, prevalence = prevalence_idc, positive = "yes")
+```
+
+
+#### Sludge/microlithiasis
+##### TFDF-model
+
+Tensorflow random forests model.
+```{r}
+sludge_mic$has_idc = as.character(sludge_mic$has_idc)
+sludge_mic$has_idc[sludge_mic$has_idc == "1"] = "yes"
+sludge_mic$has_idc[sludge_mic$has_idc == "0"] = "no"
+sludge_mic$pred_idc = as.character(sludge_mic$pred_idc)
+sludge_mic$pred_idc[sludge_mic$pred_idc == TRUE] = "yes"
+sludge_mic$pred_idc[sludge_mic$pred_idc == FALSE] = "no"
+
+table_tfdf_sludge_mic = table(sludge_mic[, c("pred_idc", "has_idc")])
+confusionMatrix(table_tfdf_sludge_mic, prevalence = prevalence_idc, positive = "yes")
+```
+
+
+##### CBD model
+CBD 8 mm or larger
+```{r}
+sludge_mic$cbd_gte_8mm = "no"
+sludge_mic$cbd_gte_8mm[sludge_mic$dhc_in_mm >= 8] = "yes"
+
+table_dhc_sludge_mic = table(sludge_mic[, c("cbd_gte_8mm", "has_idc")])
+confusionMatrix(table_dhc_sludge_mic, prevalence = prevalence_idc, positive = "yes")
+```
+
+
+### Summary table
+```{r}
+perf_summary = sapply(list(
+            "TFDF-Model" = table_tfdf,
+            "CBD & BILIRUBIN" = table_dhc_and_bil,
+            "CBD" = table_dhc,
+            "BILIRUBIN" = table_bil,
+            "Subgroup Stones: TFDF-Model" = table_tfdf_stones,
+            "Subgroup Stones: CBD" = table_dhc_stones,
+            "Subgroup Sludge/microlithiasis: TFDF-Model" = table_tfdf_sludge_mic,
+            "Subgroup Sludge/microlithiasis: CBD" = table_dhc_sludge_mic),
+       get_perf, 
+       prevalence = prevalence_idc, 
+       simplify = TRUE, USE.NAMES = TRUE)
+
+
+perf_summary %>%
+  data.frame() %>%
+  kbl() %>%
+  kable_styling()
+
+```
+
+
+
+### Figure 3
+```{r fig.height=8, fig.width=8, dpi=600}
+
+
+# Generate mosaic data
+mosaic_data <- test_df %>%
+    pivot_longer(c(pred_idc, cbd_gte_8mm_AND_bili_gte_4)) %>%
+    filter(!is.na(value)) %>%
+    mutate(name = gsub("-", " ", name)) %>%
+    mutate(name = gsub("_", " ", name)) %>%
+    mutate(name = str_to_upper(name)) %>%
+    add_column(rule_in_out = ifelse(.$value == "no" & .$has_idc == "no",
+                                    "Correct rule-out",
+                             ifelse(.$value == "yes" & .$has_idc == "yes",
+                                    "Correct rule-in",
+                             ifelse(.$value == "no" & .$has_idc == "yes",
+                                    "False rule-out",
+                             ifelse(.$value == "yes" & .$has_idc == "no",
+                                    "False rule-in", NA))))) %>%
+    mutate(rule_in_out = as.factor(rule_in_out)) %>%
+    mutate(has_idc = as.factor(has_idc)) %>%
+    add_column(score_rule = sapply(as.logical(.$value == "yes"),
+                                   function(x) ifelse(x, "rule-in", "rule-out"))) 
+
+fill_pal <- pal_jco("default")(4)
+pA <- ggplot(data = mosaic_data) +
+    geom_mosaic(aes(x = product(score_rule, has_idc)),
+                fill = rep(fill_pal, 2),
+                offset = 0.02) +
+    labs(x = "IDC diagnosed by ERC/MRC/EUS/AS",
+         y = "Score result",
+         fill = "Rule-out by score") +
+    theme_minimal() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+    facet_wrap("name")
+
+# Add custom legend
+legend <- ggplot(mosaic_data, aes(x = rule_in_out, fill = rule_in_out)) + 
+    geom_bar() +
+    scale_fill_manual(values = fill_pal[c(3, 2, 1, 4)]) +
+    labs(fill = "")
+legend <- get_legend(legend)
+legend <- as_ggplot(legend)
+pA <- ggarrange(pA, legend, widths = c(5,1))
+
+roc_df <- rbind(make_roc_df(test_df, test_df$pred_prob, "PRED IDC"),
+                make_roc_df(test_df, test_df$lab_values_admission_bilirubin_in_mg_dl, "BILIRUBIN"),
+                make_roc_df(test_df, test_df$dhc_in_mm, "CBD DIAMETER"))
+
+plt_df <- roc_df %>%
+    filter(Score != "PRED IDC") %>%
+    mutate(Score = as.factor(as.character(Score))) %>%
+    group_by(Score) %>%
+    summarize(AUC = first(AUC),
+              CI95_upper = first(CI95_upper),
+              CI95_lower = first(CI95_lower))
+
+# Offsets for vertical stacking
+y_offsets <- seq(0.1, 0.05, length.out = nrow(plt_df))
+
+pB <- ggplot(filter(roc_df, Score != "PRED IDC"), aes(x = FPR, y = TPR, color = Score)) +
+    geom_line() +
+    geom_line(data = data.frame(x = c(0, 1), y = c(0, 1)),
+              mapping = aes(x = x, y = y, colour = NULL),
+              lty = "dashed") +
+    labs(x = "1 - specificity (FPR)",
+         y = "Sensitivity (TPR)") +
+    scale_color_jco() +
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    geom_text(data = plt_df,
+              aes(x = 0.3, y = y_offsets,
+                  label = paste0("AUC: ", AUC, " (CI 95%: ", CI95_upper, ", ", CI95_lower, ")")),
+              hjust = 0, vjust = 0, size = 3.5)
+
+plt_df2 <- roc_df %>%
+    filter(Score == "PRED IDC") %>%
+    mutate(Score = as.factor(as.character(Score)))
+
+pC <- ggplot(filter(plt_df2, Score == "PRED IDC"), aes(x = FPR, y = TPR, color = Score)) +
+    geom_line() +
+    geom_line(data = data.frame(x = c(0, 1), y = c(0, 1)),
+              mapping = aes(x = x, y = y, colour = NULL),
+              lty = "dashed") +
+    labs(x = "1 - specificity (FPR)",
+         y = "Sensitivity (TPR)") +
+    scale_color_manual(values = pal_jco("default")(1)) +
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    geom_text(data = plt_df2,
+              aes(x = 0.3, y = 0.1,
+                  label = paste0("AUC: ", AUC, " (CI 95%: ", CI95_upper, ", ", CI95_lower, ")")),
+              hjust = 0, vjust = 0, size = 3.5)
+
+plot_data <- all_data
+plot_data$has_idc <- as.character(plot_data$has_idc)
+plot_data$has_idc[plot_data$has_idc == "1"] <- "yes"
+plot_data$has_idc[plot_data$has_idc == "0"] <- "no"
+
+pBC <- ggarrange(pB, pC, labels = c("B", "C"), nrow = 1)
+p <- ggarrange(pA, pBC, labels = c("A", ""), nrow = 2, heights = c(5, 6))
+ggplot2::ggsave("Figure 3. Comparison of decision rules.pdf", p, device = "pdf", height = 8, width = 10)
+# Print the final plot
+print(p)
+```
+
+**Figure 3. Comparison of decision rules.** (A) Mosaic diagram with each field’s size corresponding to the count of correct and false rule-in and -out (i.e. to the four fields of the respective contingency tables). False rule-out in red signifies missed IDCs and the correct rule-out in dark-blue corresponds to correctly avoided ERCs. (B) Two ROC curves were plotted for the TFDF model and the CBD diameter.
+
+### Figure 4
+Model performance for subgroups
+```{r fig.height=8, fig.width=10, dpi=600}
+roc_df <- rbind(make_roc_df(stones, stones$pred_prob, "PRED IDC"),
+                make_roc_df(stones, stones$lab_values_admission_bilirubin_in_mg_dl, "BILIRUBIN"),
+                make_roc_df(stones, stones$dhc_in_mm, "CBD DIAMETER"))
+
+
+pA = ggplot(roc_df, aes(x = FPR, y = TPR)) +
+    geom_line() +
+    geom_line(data = data.frame(x = c(0,1), y = c(0,1)),
+              mapping = aes(x=x, y=y, colour = NULL),
+              lty = "dashed") +
+    labs(x = "1 - specificity (FPR)",
+         y = "Gallstones; Sensitivity (TPR)") +
+    theme_minimal() +
+    facet_wrap("Score") + 
+    geom_text(data = roc_df,
+              aes(1, 1, 
+                  label = paste0("AUC: ", AUC, " (CI 95%: ", CI95_upper, ", ", CI95_lower, ")")),
+              hjust = 1.6,
+              vjust = 2,
+              size=3) 
+
+roc_df = rbind(
+                make_roc_df(sludge_mic, sludge_mic$pred_prob, "PRED IDC"),
+                make_roc_df(sludge_mic, sludge_mic$lab_values_admission_bilirubin_in_mg_dl, "BILIRUBIN"),
+                make_roc_df(sludge_mic, sludge_mic$dhc_in_mm, "CBD DIAMETER")
+              )
+
+
+pB = ggplot(roc_df, aes(x = FPR, y = TPR)) +
+    geom_line() +
+    geom_line(data = data.frame(x = c(0,1), y = c(0,1)),
+              mapping = aes(x=x, y=y, colour = NULL),
+              lty = "dashed") +
+    labs(x = "1 - specificity (FPR)",
+         y = "Sludge/Microlithiasis; Sensitivity (TPR)") +
+    theme_minimal() +
+    facet_wrap("Score") + 
+    geom_text(data = roc_df,
+              aes(1, 1, 
+                  label = paste0("AUC: ", AUC, " (CI 95%: ", CI95_upper, ", ", CI95_lower, ")")),
+              hjust = 1.6,
+              vjust = 2,
+              size=3) 
+
+
+plot_data = all_data
+plot_data$has_idc = as.character(plot_data$has_idc)
+plot_data$has_idc[plot_data$has_idc == "1"] = "yes"
+plot_data$has_idc[plot_data$has_idc == "0"] = "no"
+
+p = ggarrange(pA, pB, labels = c("A", "B"), nrow = 2, heights = c(1,1))
+ggplot2::ggsave("Figure 4. Comparison of decision rules for microlithiasis and sludge.pdf", p, device = "pdf", height = 8, width = 10)
+p
+```
+**Figure 4. Comparison of decision rules for microlithiasis and sludge.** Model performances were computed for two subgroups: patients with gallstones (A, n=`r nrow(stones)`) and with sludge and/or microlithiasis (B, n=`r nrow(sludge_mic)`). For each subgroup, two ROC curves were plotted for the TFDF model and the CBD diameter.
+
+
+### Figure 5?
+Something like that?
+
+```{r fig.height=4, fig.width=12, dpi=600}
+
+p2 = ggplot(plot_data, aes(x=has_idc, y = eus_ercp_mrcp_or_as_dhc_width_in_mm,
+                               fill = has_idc)) +
+    geom_violin(width = 0.8, alpha = 0.5) +
+    geom_boxplot(width = 0.1, alpha = 0.5) +
+    geom_hline(yintercept=11, linetype="dashed") +
+    geom_hline(yintercept=8, linetype="dotted") +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(# title = "D-dimer",
+         y = "CBD [mm]",
+         x = "Diagnosis of IDC [yes/no]",
+         #fill = "PE"
+         ) +
+    scale_y_log10() +
+    geom_signif(
+        comparisons = list(c("yes", "no")),
+        map_signif_level = FALSE
+        ) 
+
+p5 = ggscatter(plot_data,
+               x = "lab_values_admission_bilirubin_in_mg_dl",
+               y = "eus_ercp_mrcp_or_as_dhc_width_in_mm",
+          add = "reg.line",color = "has_idc", shape = "has_idc",palette = "jco",
+          add.params = list(color = "blue", fill = "lightgray"),
+          conf.int = TRUE) +
+    scale_x_log10() +
+    scale_y_log10() +
+    stat_cor(method = "spearman", label.x = 0.7, label.y = 1.5) +
+    labs(x = "Bilirubin [mg/dl]",
+         y = "CBD [mm]",
+         color = "IDC",
+         shape = "IDC"
+    ) +
+    geom_hline(yintercept=11, linetype="dashed") +
+    geom_hline(yintercept=8, linetype="dotted") +
+    geom_vline(xintercept=4, linetype="dashed") +
+    geom_vline(xintercept=1, linetype="dotted") +
+    theme_minimal() +
+    theme(legend.position = "right")
+
+p6 = ggplot(plot_data, aes(x=has_idc, y = lab_values_admission_bilirubin_in_mg_dl,
+                               fill = has_idc)) +
+    geom_violin(width = 0.8, alpha = 0.5) +
+    geom_boxplot(width = 0.1, alpha = 0.5) +
+    geom_hline(yintercept=4, linetype="dashed") +
+    geom_hline(yintercept=1, linetype="dotted") +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(
+         y = "Bilirubin [mg/dl]",
+         x = "Diagnosis of IDC [yes/no]",
+         ) +
+    scale_y_log10() +
+    geom_signif(
+        comparisons = list(c("yes", "no")),
+        map_signif_level = FALSE
+        ) 
+
+pA = ggarrange(set_palette(p2, "jco"),
+               set_palette(p6, "jco"),
+               set_palette(p5, "jco"), labels = c("A", "B", "C"),
+               ncol = 3,
+               widths = c(3,3,8))
+
+ggplot2::ggsave("Figure 5. CBD diameter.pdf", pA, device = "pdf", height = 5, width = 12)
+pA
+```
+
+**Figure 5. CBD diameter.** (A) Violin plot of CBD diameters comparing IDC versus no IDC. The p-value is calculated using a two-sided Mann-Whitney test. The dashed line corresponds to a CBD of 11 mm; the dotted line to 7 mm. (B) Spearman correlation of CBD diameter and gGT. The vertical dashed line corresponds to a gGT of 50 U/l; values < 1.5 pg/ml are considered normal. Note the log-transformed axes for gGT in (B).
+
+# Appendix
+
+## TFDF Model partial tree
+first three levels
+````{=html}
+```{r, echo=FALSE, results='asis'}
+xfun::file_string('data/tree-levels-1-3.svg')
+```
+````
+
+## TFDF Model full tree
+````{=html}
+```{r, echo=FALSE, results='asis'}
+xfun::file_string('data/tree-levels-all.svg')
+```
+````
+
+
+
